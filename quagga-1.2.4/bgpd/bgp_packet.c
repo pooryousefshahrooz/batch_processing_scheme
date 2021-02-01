@@ -50,7 +50,11 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #include "bgpd/bgp_encap.h"
 #include "bgpd/bgp_advertise.h"
 #include "bgpd/bgp_vty.h"
-
+/* batch processing code: we use global variables to check if all the received routes have beeen processed or not 
+here we import them from bgpd.c
+*/
+extern int policy_checking_flag;
+extern int scheduled_routes_counter;
 int stream_put_prefix (struct stream *, struct prefix *);
 
 /* Set up BGP packet marker and packet type. */
@@ -144,8 +148,11 @@ bgp_connect_check (struct peer *peer)
 static struct stream *
 bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
 {
+  /* batch processing codes: we check if the policy_checking_flag is on or off. If it is off, we can not send packets.*/
+  if(policy_checking_flag==0) 
+    return NULL;
   /* no MRAI comment: logging the moment we start building the update message */
-  zlog_debug ("we are sending message to %ld" ,peer->as);
+  zlog_debug ("we are constructing an update message to %ld, flag is %ld, route counter is %ld" ,peer->as,policy_checking_flag,scheduled_routes_counter);
   int number_of_sent_prefix_counter = 0;
   struct stream *s;
   struct stream *snlri;
@@ -303,8 +310,8 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
       BGP_WRITE_ON (peer->t_write, bgp_write, peer->fd);
       stream_reset (s);
       stream_reset (snlri);
-      /* no MRAI comment: logging the moment we finished building the update message */
-      zlog_debug ("we finished building the update message including %ld prefixes to %ld" ,number_of_sent_prefix_counter,peer->as);
+      /* batch processing comment: logging the moment we finished building the update message */
+      zlog_debug ("we finished building the update message including %ld prefixes to %s %ld and flag is %ld, route counter is %ld" ,number_of_sent_prefix_counter,peer->host,peer->as,policy_checking_flag,scheduled_routes_counter);
       return packet;
     }
   return NULL;
@@ -363,6 +370,9 @@ bgp_update_packet_eor (struct peer *peer, afi_t afi, safi_t safi)
 static struct stream *
 bgp_withdraw_packet (struct peer *peer, afi_t afi, safi_t safi)
 {
+/* batch processing code: we check if the policy_checking_flag is on or off. If it is off, we can not send packets.*/
+  if(policy_checking_flag==0) 
+    return NULL;
   /* no MRAI comment: logging sending a withdraw update message and counting the number of prefixes in it */
   zlog_debug ("we are sending withdraw message to %ld" ,peer->as);
   int sent_prefix_in_withdraw_counter = 0;
@@ -741,6 +751,8 @@ bgp_write (struct thread *thread)
   if (!s)
     return 0;	/* nothing to send */
 
+  /* batch processing code: calling bgp_read_all function to check if there is anything in the queue */
+  bgp_read_all(peer);
   sockopt_cork (peer->fd, 1);
 
   /* Nonblocking write until TCP output buffer is full.  */
@@ -780,7 +792,6 @@ bgp_write (struct thread *thread)
 	  peer->open_out++;
 	  break;
 	case BGP_MSG_UPDATE:
-    written_update_message_counter++;
 	  peer->update_out++;
 	  break;
 	case BGP_MSG_NOTIFY:
@@ -804,9 +815,10 @@ bgp_write (struct thread *thread)
 
       /* OK we send packet so delete it. */
       bgp_packet_delete (peer);
+      written_update_message_counter++;
     }
   while (++count < BGP_WRITE_PACKET_MAX &&
-	 (s = bgp_write_packet (peer)) != NULL);
+	 (s = bgp_write_packet (peer)) != NULL && (policy_checking_flag==1));
   
   if (bgp_write_proceed (peer))
     BGP_WRITE_ON (peer->t_write, bgp_write, peer->fd);
@@ -814,7 +826,7 @@ bgp_write (struct thread *thread)
   switch (type)
   {
   case BGP_MSG_UPDATE:
-    zlog_debug ("*******...we wrote %ld update messages to socket for %ld",written_update_message_counter,peer->as);
+  zlog_debug ("*******...we wrote %ld update messages to socket for %ld and flag is %ld, route counter is %ld",written_update_message_counter,peer->as,policy_checking_flag,scheduled_routes_counter);
   }
  done:
   sockopt_cork (peer->fd, 0);
@@ -2742,3 +2754,263 @@ bgp_read (struct thread *thread)
     }
   return 0;
 }
+
+/* batch processing codes */
+/* batch processing codes: read one packet on the incomming socket of all peers 
+and set the export policy checking off if it read at least one packet*/
+int bgp_read_all(struct peer *peer)
+{
+  int received_a_new_update = 1;
+  while (received_a_new_update ==1)
+    {
+      received_a_new_update = check_queue_batch_processing(peer);
+    }
+return 0;
+}
+
+/* batch processing codes: a copy of bgp_read() function that has modified to only log one extra message*/
+int 
+batch_processing_bgp_read (struct thread *thread,struct peer *target_peer_to_be_advertised)
+{
+  int ret;
+  u_char type = 0;
+  struct peer *peer;
+  bgp_size_t size;
+  char notify_data_length[2];
+  peer = THREAD_ARG (thread);
+  peer->t_read = NULL;
+if((peer->host != NULL) && (target_peer_to_be_advertised != peer) && (peer->status == Established))
+{
+  /* For non-blocking IO check. */
+  if (peer->status == Connect)
+    {
+      bgp_connect_check (peer);
+      goto done;
+    }
+  else
+    {
+      if (peer->fd < 0)
+  {
+    return -1;
+  }
+      BGP_READ_ON (peer->t_read, bgp_read, peer->fd);
+    }
+  /* Read packet header to determine type of the packet */
+  if (peer->packet_size == 0)
+    peer->packet_size = BGP_HEADER_SIZE;
+
+  if (stream_get_endp (peer->ibuf) < BGP_HEADER_SIZE)
+    {
+      ret = bgp_read_packet (peer);
+
+      /* Header read error or partial read packet. */
+      if (ret < 0) 
+      {
+  goto done;
+}
+      /* Get size and type. */
+      stream_forward_getp (peer->ibuf, BGP_MARKER_SIZE);
+      memcpy (notify_data_length, stream_pnt (peer->ibuf), 2);
+      size = stream_getw (peer->ibuf);
+      type = stream_getc (peer->ibuf);
+      if (BGP_DEBUG (normal, NORMAL) && type != 2 && type != 0)
+  zlog_debug ("%s rcv message type %d, length (excl. header) %d",
+       peer->host, type, size - BGP_HEADER_SIZE);
+
+      /* Marker check */
+      if (((type == BGP_MSG_OPEN) || (type == BGP_MSG_KEEPALIVE))
+    && ! bgp_marker_all_one (peer->ibuf, BGP_MARKER_SIZE))
+  {
+    bgp_notify_send (peer,
+         BGP_NOTIFY_HEADER_ERR, 
+         BGP_NOTIFY_HEADER_NOT_SYNC);
+    goto done;
+  }      /* BGP type check. */
+      if (type != BGP_MSG_OPEN && type != BGP_MSG_UPDATE 
+    && type != BGP_MSG_NOTIFY && type != BGP_MSG_KEEPALIVE 
+    && type != BGP_MSG_ROUTE_REFRESH_NEW
+    && type != BGP_MSG_ROUTE_REFRESH_OLD
+    && type != BGP_MSG_CAPABILITY)
+  {
+    if (BGP_DEBUG (normal, NORMAL))
+      plog_debug (peer->log,
+          "%s unknown message type 0x%02x",
+          peer->host, type);
+    bgp_notify_send_with_data (peer,
+             BGP_NOTIFY_HEADER_ERR,
+             BGP_NOTIFY_HEADER_BAD_MESTYPE,
+             &type, 1);
+    goto done;
+  }
+      /* Mimimum packet length check. */
+      if ((size < BGP_HEADER_SIZE)
+    || (size > BGP_MAX_PACKET_SIZE)
+    || (type == BGP_MSG_OPEN && size < BGP_MSG_OPEN_MIN_SIZE)
+    || (type == BGP_MSG_UPDATE && size < BGP_MSG_UPDATE_MIN_SIZE)
+    || (type == BGP_MSG_NOTIFY && size < BGP_MSG_NOTIFY_MIN_SIZE)
+    || (type == BGP_MSG_KEEPALIVE && size != BGP_MSG_KEEPALIVE_MIN_SIZE)
+    || (type == BGP_MSG_ROUTE_REFRESH_NEW && size < BGP_MSG_ROUTE_REFRESH_MIN_SIZE)
+    || (type == BGP_MSG_ROUTE_REFRESH_OLD && size < BGP_MSG_ROUTE_REFRESH_MIN_SIZE)
+    || (type == BGP_MSG_CAPABILITY && size < BGP_MSG_CAPABILITY_MIN_SIZE))
+  {
+    if (BGP_DEBUG (normal, NORMAL))
+      plog_debug (peer->log,
+          "%s bad message length - %d for %s",
+          peer->host, size, 
+          type == 128 ? "ROUTE-REFRESH" :
+          bgp_type_str[(int) type]);
+    bgp_notify_send_with_data (peer,
+             BGP_NOTIFY_HEADER_ERR,
+               BGP_NOTIFY_HEADER_BAD_MESLEN,
+             (u_char *) notify_data_length, 2);
+    goto done;
+  }
+      /* Adjust size to message length. */
+      peer->packet_size = size;
+    }
+  ret = bgp_read_packet (peer);
+  if (ret < 0) 
+  {
+    goto done;
+  }
+  /* Get size and type again. */
+  size = stream_getw_from (peer->ibuf, BGP_MARKER_SIZE);
+  type = stream_getc_from (peer->ibuf, BGP_MARKER_SIZE + 2);
+
+  /* BGP packet dump function. */
+  bgp_dump_packet (peer, type, peer->ibuf);
+  
+  size = (peer->packet_size - BGP_HEADER_SIZE);
+
+  /* Read rest of the packet and call each sort of packet routine */
+  switch (type) 
+    {
+    case BGP_MSG_OPEN:
+      peer->open_in++;
+      bgp_open_receive (peer, size); /* XXX return value ignored! */
+      break;
+    case BGP_MSG_UPDATE:
+      peer->readtime = bgp_recent_clock ();
+      zlog_debug("reading update message from queue in batch processing scheme from %s, %ld",peer->host,peer->as);
+      bgp_update_receive (peer, size);
+      break;
+    case BGP_MSG_NOTIFY:
+      bgp_notify_receive (peer, size);
+      break;
+    case BGP_MSG_KEEPALIVE:
+      peer->readtime = bgp_recent_clock ();
+      bgp_keepalive_receive (peer, size);
+      break;
+    case BGP_MSG_ROUTE_REFRESH_NEW:
+    case BGP_MSG_ROUTE_REFRESH_OLD:
+      peer->refresh_in++;
+      bgp_route_refresh_receive (peer, size);
+      break;
+    case BGP_MSG_CAPABILITY:
+      peer->dynamic_cap_in++;
+      bgp_capability_receive (peer, size);
+      break;
+    }
+
+  /* Clear input buffer. */
+  peer->packet_size = 0;
+  if (peer->ibuf)
+  {
+    stream_reset (peer->ibuf);
+  }
+
+ done:
+  if (CHECK_FLAG (peer->sflags, PEER_STATUS_ACCEPT_PEER))
+    {
+      if (BGP_DEBUG (events, EVENTS))
+  zlog_debug ("%s [Event] Accepting BGP peer delete", peer->host);
+      peer_delete (peer);
+    }
+  return 0;
+}
+else
+return -1;
+}
+
+#define fd_copy_fd_set(X) (X)
+
+/* batch processing codes: get the thread of the passed file descriptor and calling batch_processing_bgp_read function to read the data from it */
+int call_read_thread(struct thread_master *m, struct thread *thread, thread_fd_set *fdset,struct peer *peer)
+{
+  thread_fd_set *mfdset = NULL;
+  struct thread **thread_array;
+  int bgp_read_ret_value = 0;
+  if (!thread)
+    return 0;
+  if (thread->type == THREAD_READ)
+    {
+      mfdset = &m->readfd;
+      thread_array = m->read;
+    }
+  else
+    {
+      mfdset = &m->writefd;
+      thread_array = m->write;
+    }
+  if (fd_is_set (THREAD_FD (thread), fdset))
+    {
+      bgp_read_ret_value = batch_processing_bgp_read(thread,peer);
+      fd_clear_read_write (THREAD_FD (thread), mfdset);
+      thread_delete_fd (thread_array, thread);
+      thread_list_add (&m->ready, thread);
+      thread->type = THREAD_READY;
+      return 1;
+    }
+}
+
+/* batch processing codes: for each file descriptor returned by select function, call  call_read_thread */
+int handle_read_df_set(struct thread_master *m, thread_fd_set *rset ,int num, struct peer *target_peer_to_be_advertised)
+{
+  int ready = 0, index;
+  for (index = 0; index < m->fd_limit && ready < num; ++index)
+    {
+      ready += call_read_thread (m, m->read[index], rset,target_peer_to_be_advertised);
+    }
+  return num - ready;
+
+}
+/* batch processing codes: checking incoming sockets for all peers by calling select system call*/
+int check_queue_batch_processing( struct peer * peer)
+{
+  char buf[INET6_BUFSIZ];
+  struct peer *peer2,*peer3;
+  struct listnode *node, *nnode;
+  struct bgp *bgp;
+  bgp_size_t size;
+  bgp = bgp_get_default ();
+  int check_queue_result;
+  fd_set rfds;
+  struct timeval tv;
+  int retval ;
+
+  /* Watch stdin (fd 0) to see when it has input. */
+  FD_ZERO(&rfds);
+  FD_SET(0, &rfds);
+  /* Wait up to these seconds and nanoseconds. */
+  tv.tv_sec = 0;
+  tv.tv_usec = 10;
+
+  struct thread *thread;
+  thread_fd_set readfd;
+  int num = 0;
+  struct timeval timer_val = { .tv_sec = 0, .tv_usec = 0 };
+  //  Normal event are the next highest priority.  
+  thread_process (&(bm->master)->event);
+     /* Structure copy.  */
+  readfd = fd_copy_fd_set(bm->master->readfd);
+  num = fd_select (FD_SETSIZE, &readfd, NULL, NULL, &tv);
+    /* Got IO, process it */
+  if (num > 0)
+  {
+    handle_read_df_set (bm->master, &readfd,num,peer);
+    return 1;
+  }
+  else
+    return 0;
+}
+

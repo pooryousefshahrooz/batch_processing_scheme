@@ -58,7 +58,9 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_mpath.h"
 #include "bgpd/bgp_nht.h"
-
+/* batch processing codes: we use global variables to check if all the received routes have beeen processed or not */
+extern int policy_checking_flag;
+extern int scheduled_routes_counter;
 /* Extern from bgp_dump.c */
 extern const char *bgp_origin_str[];
 extern const char *bgp_origin_long_str[];
@@ -1634,6 +1636,12 @@ bgp_process_main (struct work_queue *wq, void *data)
           
 	  UNSET_FLAG (old_select->flags, BGP_INFO_MULTIPATH_CHG);
           UNSET_FLAG (rn->flags, BGP_NODE_PROCESS_SCHEDULED);
+          /* batch processing code: we check if we have processed all scheduled routes to be processed or not.
+          if yes, the policy_checking_flag will set to on. */
+          if (--scheduled_routes_counter<1)
+            policy_checking_flag=1;
+          else
+            policy_checking_flag=0;
           return WQ_SUCCESS;
         }
     }
@@ -1680,6 +1688,12 @@ bgp_process_main (struct work_queue *wq, void *data)
     bgp_info_reap (rn, old_select);
   
   UNSET_FLAG (rn->flags, BGP_NODE_PROCESS_SCHEDULED);
+  /* batch processing code: we check if we have processed all scheduled routes to be processed or not.
+  if yes, the policy_checking_flag will set to on. */
+  if (--scheduled_routes_counter<1)
+    policy_checking_flag=1;
+  else
+    policy_checking_flag=0;
   return WQ_SUCCESS;
 }
 
@@ -1770,6 +1784,12 @@ bgp_process (struct bgp *bgp, struct bgp_node *rn, afi_t afi, safi_t safi)
     {
       case BGP_TABLE_MAIN:
         work_queue_add (bm->process_main_queue, pqnode);
+        /* batch processing codes: add one to scheduled_routes_counter 
+        as we schedule one route to be processed in the future
+        we set the policy_checking_flag off as it is obvious there is something in the queue to be processed.
+        */
+        ++scheduled_routes_counter;
+        policy_checking_flag = 0;
         break;
       case BGP_TABLE_RSCLIENT:
         work_queue_add (bm->process_rsclient_queue, pqnode);
@@ -3410,8 +3430,8 @@ bgp_nlri_parse_ip (struct peer *peer, struct attr *attr,
                 peer->host);
       return -1;
     }
-  /* no MRAI: logging receiving update/withdraw message */
-  zlog_debug ("we finished receiving %ld prefixes in update and %ld prefixes in withdraw message from %ld",prefix_receiver_counter,prefix_in_withdraw_receiver_counter,peer->as);
+  /* batch processing comment: logging receiving update/withdraw message */
+  zlog_debug ("*******... we finished receiving %ld prefixes in update and %ld prefixes in withdraw message from %ld flag is %ld, route counter is %ld",prefix_receiver_counter,prefix_in_withdraw_receiver_counter,peer->as,policy_checking_flag,scheduled_routes_counter);
   return 0;
 }
 

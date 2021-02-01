@@ -557,7 +557,8 @@ thread_master_create ()
 }
 
 /* Add a new thread to the list.  */
-static void
+/* batch processing code: remove static keyword */
+ void
 thread_list_add (struct thread_list *list, struct thread *thread)
 {
   thread->next = NULL;
@@ -587,7 +588,8 @@ thread_list_delete (struct thread_list *list, struct thread *thread)
   return thread;
 }
 
-static void
+/* batch processing code: changing static void to void */
+ void
 thread_delete_fd (struct thread **thread_array, struct thread *thread)
 {
   thread_array[thread->u.fd] = NULL;
@@ -745,20 +747,21 @@ thread_get (struct thread_master *m, u_char type,
 }
 
 #define fd_copy_fd_set(X) (X)
-
-static int
+/* batch processing code: we change the fd_select from static int to int in order to be able to call it from bgp_packet.c file */
+ int
 fd_select (int size, thread_fd_set *read, thread_fd_set *write, thread_fd_set *except, struct timeval *t)
 {
   return(select(size, read, write, except, t));
 }
 
-static int
+/* batch processing code: remove static keyword */
+ int
 fd_is_set (int fd, thread_fd_set *fdset)
 {
   return FD_ISSET (fd, fdset);
 }
-
-static int
+/* batch processing code: remove static keyword */
+ int
 fd_clear_read_write (int fd, thread_fd_set *fdset)
 {
   if (!FD_ISSET (fd, fdset))
@@ -1117,7 +1120,8 @@ thread_timer_process (struct pqueue *queue, struct timeval *timenow)
 }
 
 /* process a list en masse, e.g. for event thread lists */
-static unsigned int
+/* batch processing code: we remove the static keyword to be able to call this fucntion from bgp_packet.c */
+ unsigned int
 thread_process (struct thread_list *list)
 {
   struct thread *thread;
